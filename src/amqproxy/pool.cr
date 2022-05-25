@@ -18,7 +18,8 @@ module AMQProxy
       while has_connection == false && attempts < max_attempts
         max_attempts += 1
         begin
-          u = get_upstream()
+          u = get_upstream(user, password, vhost)
+          yield u
         ensure
           if u.nil?
             @size -= 1
@@ -34,7 +35,7 @@ module AMQProxy
             end
           end
         end
-      yield u
+      end
     end
 
     def close
@@ -52,7 +53,7 @@ module AMQProxy
       end
     end
 
-    private def get_upstream
+    private def get_upstream(user : String, password : String, vhost : String)
       @lock.synchronize do
         q = @pools[{ user, password, vhost }]
         q.shift do
