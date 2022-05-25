@@ -12,28 +12,29 @@ module AMQProxy
     end
 
     def borrow(user : String, password : String, vhost : String, &block : Upstream -> _)
-      u = @lock.synchronize do
-        q = @pools[{ user, password, vhost }]
-        q.shift do
-          @size += 1
-          @metrics_client.increment("connections.upstream.created", 1)
-          Upstream.new(@host, @port, @tls, @log).connect(user, password, vhost)
+      max_attempts = 10
+      attempts = 0
+      has_connection = false
+      while has_connection == false && attempts < max_attempts
+        max_attempts += 1
+        begin
+          u = get_upstream()
+        ensure
+          if u.nil?
+            @size -= 1
+            @log.error "Upstream connection could not be established"
+          elsif u.closed?
+            @size -= 1
+            @log.error "Upstream connection closed when returned"
+          else
+            has_connection = true
+            u.last_used = Time.monotonic
+            @lock.synchronize do
+              @pools[{ user, password, vhost }].push u
+            end
+          end
         end
-      end
       yield u
-    ensure
-      if u.nil?
-        @size -= 1
-        @log.error "Upstream connection could not be established"
-      elsif u.closed?
-        @size -= 1
-        @log.error "Upstream connection closed when returned"
-      else
-        u.last_used = Time.monotonic
-        @lock.synchronize do
-          @pools[{ user, password, vhost }].push u
-        end
-      end
     end
 
     def close
@@ -48,6 +49,17 @@ module AMQProxy
           end
         end
         @size = 0
+      end
+    end
+
+    private def get_upstream
+      @lock.synchronize do
+        q = @pools[{ user, password, vhost }]
+        q.shift do
+          @size += 1
+          @metrics_client.increment("connections.upstream.created", 1)
+          Upstream.new(@host, @port, @tls, @log).connect(user, password, vhost)
+        end
       end
     end
 
