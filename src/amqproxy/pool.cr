@@ -16,7 +16,8 @@ module AMQProxy
       attempts = 0
       has_connection = false
       while has_connection == false && attempts < max_attempts
-        max_attempts += 1
+        attempts += 1
+        @log.info "Attempting upstream connection: #{attempts}"
         begin
           u = get_upstream(user, password, vhost)
           yield u
