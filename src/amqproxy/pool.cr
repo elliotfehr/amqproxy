@@ -2,7 +2,7 @@ module AMQProxy
   class Pool
     getter :size
 
-    def initialize(@host : String, @port : Int32, @tls : Bool, @log : Logger, @idle_connection_timeout : Int32)
+    def initialize(@host : String, @port : Int32, @tls : Bool, @log : Logger, @idle_connection_timeout : Int32, @metrics_client : MetricsClient = DummyMetricsClient.new)
       @pools = Hash(Tuple(String, String, String), Deque(Upstream)).new do |h, k|
         h[k] = Deque(Upstream).new
       end
@@ -13,9 +13,10 @@ module AMQProxy
 
     def borrow(user : String, password : String, vhost : String, &block : Upstream -> _)
       u = @lock.synchronize do
-        c = @pools[{ user, password, vhost }].pop?
+        c = @pools[{user, password, vhost}].pop?
         if c.nil? || c.closed?
           @size += 1
+          @metrics_client.increment("connections.upstream.created", 1)
           c = Upstream.new(@host, @port, @tls, @log).connect(user, password, vhost)
         end
         c
@@ -32,7 +33,7 @@ module AMQProxy
       else
         u.last_used = Time.monotonic
         @lock.synchronize do
-          @pools[{ user, password, vhost }].push u
+          @pools[{user, password, vhost}].push u
         end
       end
     end
@@ -64,11 +65,13 @@ module AMQProxy
                 @size -= 1
                 begin
                   u.close "Pooled connection closed due to inactivity"
+                  @metrics_client.increment("connections.upstream.closed", 1)
                 rescue ex
                   @log.error "Problem closing upstream: #{ex.inspect}"
                 end
               elsif u.closed?
                 @size -= 1
+                @metrics_client.increment("connections.upstream.closed", 1)
                 @log.error "Removing closed upstream connection from pool"
               else
                 q.push u
@@ -76,6 +79,7 @@ module AMQProxy
             end
           end
         end
+        @metrics_client.gauge("connections.upstream.total", @size)
       end
     end
   end

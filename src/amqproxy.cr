@@ -1,5 +1,6 @@
 require "./amqproxy/version"
 require "./amqproxy/server"
+require "./amqproxy/metrics_client"
 require "option_parser"
 require "uri"
 require "ini"
@@ -11,6 +12,8 @@ class AMQProxy::CLI
   @log_level : Logger::Severity = Logger::INFO
   @idle_connection_timeout = 5
   @upstream = ENV["AMQP_URL"]?
+  @statsd_host = ""
+  @statsd_port = 8125
 
   def parse_config(path)
     INI.parse(File.read(path)).each do |name, section|
@@ -33,6 +36,14 @@ class AMQProxy::CLI
           else                        raise "Unsupported config #{name}/#{key}"
           end
         end
+      when "statsd"
+        section.each do |key, value|
+          case key
+          when "host" then @statsd_host = value
+          when "port" then @statsd_port = value.to_i
+          else             raise "Unsupported config #{name}/#{key}"
+          end
+        end
       else raise "Unsupported config section #{name}"
       end
     end
@@ -50,6 +61,8 @@ class AMQProxy::CLI
       parser.on("-t IDLE_CONNECTION_TIMEOUT", "--idle-connection-timeout=SECONDS", "Maxiumum time in seconds an unused pooled connection stays open (default 5s)") do |v|
         @idle_connection_timeout = v.to_i
       end
+      parser.on("--statsd-host=STATSD_HOST", "StatsD host to send metrics to (default disabled)") { |p| @statsd_host = p }
+      parser.on("--statsd-port=STATSD_PORT", "StatsD port to send metrics to (default is 8125)") { |p| @statsd_port = p.to_i }
       parser.on("-d", "--debug", "Verbose logging") { @log_level = Logger::DEBUG }
       parser.on("-c FILE", "--config=FILE", "Load config file") { |v| parse_config(v) }
       parser.on("-h", "--help", "Show this help") { puts parser.to_s; exit 0 }
@@ -71,7 +84,24 @@ class AMQProxy::CLI
     port = u.port || default_port
     tls = u.scheme == "amqps"
 
-    server = AMQProxy::Server.new(u.host || "", port, tls, @log_level, @idle_connection_timeout)
+    logger = Logger.new(STDOUT)
+    logger.level = @log_level
+    journald =
+      {% if flag?(:unix) %}
+        if journal_stream = ENV.fetch("JOURNAL_STREAM", nil)
+          stdout_stat = STDOUT.info.@stat
+          journal_stream == "#{stdout_stat.st_dev}:#{stdout_stat.st_ino}"
+        end
+      {% else %}
+        false
+      {% end %}
+    logger.formatter = Logger::Formatter.new do |severity, datetime, progname, message, io|
+      io << datetime << ": " unless journald
+      io << message
+    end
+
+    metrics_client = @statsd_host.empty? ? AMQProxy::DummyMetricsClient.new : AMQProxy::StatsdClient.new(logger, @statsd_host, @statsd_port)
+    server = AMQProxy::Server.new(u.host || "", port, tls, metrics_client, logger, @idle_connection_timeout)
 
     shutdown = ->(_s : Signal) do
       server.close
